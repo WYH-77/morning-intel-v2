@@ -105,35 +105,118 @@ class WeChatWorkPusher:
         return ok
 
 
+def _utf8_truncate(text: str, max_bytes: int) -> str:
+    """
+    把字符串按 UTF-8 字节数截断，保证不把单个中文字符切成两半。
+    企业微信 markdown.content 限制 4096 字节，超出 → errcode 40058。
+    """
+    if not text:
+        return ""
+    data = text.encode("utf-8")
+    if len(data) <= max_bytes:
+        return text
+    # 从右往左找最近的 UTF-8 起始字节（1xxxxxxx 是多字节中间，直接跳过）
+    cut = max_bytes
+    while cut > 0 and (data[cut] & 0xC0) == 0x80:
+        cut -= 1
+    return data[:cut].decode("utf-8", errors="ignore")
+
+
+def _utf8_len(text: str) -> int:
+    return len(text.encode("utf-8"))
+
+
 def push_daily_report(
     webhook_url: str, markdown_content: str, force: bool = False
 ) -> bool:
     logger.info("=" * 60)
     logger.info("开始推送早盘报告...")
     pusher = WeChatWorkPusher(webhook_url)
-    # 企业微信Markdown长度限制约4096字，超长则分段发送
-    max_len = 3800
-    if len(markdown_content) <= max_len:
+
+    # 企业微信群机器人 Markdown：**content 字节数严格 ≤ 4096 字节（UTF-8）**
+    # 我们给分段 header + Markdown 结构余量约 500 字节 → 正文上限 3400 字节
+    BODY_MAX_BYTES = 3400
+    HARD_LIMIT_BYTES = 4000  # 最终整体（含 header）硬上限 4000 < 4096
+
+    total_bytes = _utf8_len(markdown_content)
+    if total_bytes <= BODY_MAX_BYTES:
         return pusher.send_markdown(markdown_content, force=force)
-    # 分段：按一级或二级标题切
-    logger.warning("报告过长(%d字符)，将分段发送", len(markdown_content))
-    chunks = []
+
+    logger.warning(
+        "报告过长(%d字符 / %d字节)，按 BODY_MAX_BYTES=%d 分段发送",
+        len(markdown_content), total_bytes, BODY_MAX_BYTES,
+    )
+    chunks: List[str] = []
     cur = ""
+    cur_bytes = 0
+
     for line in markdown_content.split("\n"):
-        if line.startswith("### ") and len(cur) > max_len * 0.7:
+        line_with_nl = line + "\n"
+        line_bytes = _utf8_len(line_with_nl)
+
+        # 优先在"### 小节标题"处切分，保证语义完整
+        if line.startswith("### ") and cur_bytes > BODY_MAX_BYTES * 0.7:
             chunks.append(cur)
-            cur = line + "\n"
+            cur = line_with_nl
+            cur_bytes = line_bytes
+            continue
+        if cur_bytes + line_bytes <= BODY_MAX_BYTES:
+            cur += line_with_nl
+            cur_bytes += line_bytes
         else:
-            cur += line + "\n"
-            if len(cur) > max_len:
-                chunks.append(cur[:max_len])
-                cur = cur[max_len:]
+            # 当前行塞不下了，先把 cur 输出为一个 chunk
+            if cur:
+                chunks.append(cur)
+            # 单行特别长（比如一整个大表格），单独按字节截断
+            if line_bytes <= BODY_MAX_BYTES:
+                cur = line_with_nl
+                cur_bytes = line_bytes
+            else:
+                # 按字节拆分这一行
+                remaining = line_with_nl
+                while _utf8_len(remaining) > BODY_MAX_BYTES:
+                    piece = _utf8_truncate(remaining, BODY_MAX_BYTES)
+                    chunks.append(piece)
+                    remaining = remaining[len(piece):]
+                cur = remaining
+                cur_bytes = _utf8_len(cur)
+
     if cur:
         chunks.append(cur)
+
+    # 兜底：任何单 chunk 若字节超过 BODY_MAX_BYTES，强制再按字节切
+    safe_chunks: List[str] = []
+    for c in chunks:
+        cb = _utf8_len(c)
+        if cb <= BODY_MAX_BYTES:
+            safe_chunks.append(c)
+        else:
+            idx = 0
+            while idx < len(c):
+                piece = _utf8_truncate(c[idx:], BODY_MAX_BYTES)
+                if not piece:
+                    break
+                safe_chunks.append(piece)
+                idx += len(piece)
+    chunks = safe_chunks
+
     all_ok = True
     for i, chunk in enumerate(chunks, 1):
-        header = f"【分段 {i}/{len(chunks)}】\n" if len(chunks) > 1 else ""
-        ok = pusher.send_markdown(header + chunk, force=force or i > 1)
+        if len(chunks) > 1:
+            header = f"【早盘情报 分段 {i}/{len(chunks)}】\n"
+        else:
+            header = ""
+        to_send = header + chunk
+        # 最终保险：整体字节数必须 < 4000（< 官方 4096 硬上限）
+        if _utf8_len(to_send) > HARD_LIMIT_BYTES:
+            to_send = _utf8_truncate(to_send, HARD_LIMIT_BYTES)
+        # 第 1 块和外层保持同样 force 参数；后续块必须 force=true
+        # （否则会因为今日已推送标记而被拦住）
+        ok = pusher.send_markdown(to_send, force=(force if i == 1 else True))
         all_ok = all_ok and ok
         time.sleep(1.0)
+    if not all_ok:
+        logger.warning("⚠️ 有部分分段推送失败（详见上方单条日志）")
+    else:
+        logger.info("✅  %d 段 Markdown 全部推送成功", len(chunks))
     return all_ok
