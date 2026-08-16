@@ -1,0 +1,137 @@
+name: 每日早盘全球股票情报精选（增强版 v2.1）
+
+# ============================================================
+# 触发方式（全部可配置，可按需启用/关闭）
+# 1. schedule：每日北京时间 09:20（工作日自动执行）
+#    注意：GitHub Actions 使用 UTC，北京(UTC+8) = UTC 01:20
+# 2. workflow_dispatch：手动点击触发（支持 --force 等参数）
+# ============================================================
+on:
+  schedule:
+    # 交易日由程序内部二次校验（周末/法定假日自动跳），为简化：周一至周五每天 09:20 触发
+    # 北京时间 09:20 == UTC 01:20
+    - cron: "20 1 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Force Run：跳过交易日校验 + 强制推送（测试用）"
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
+      as_of_date:
+        description: "🧪 回测模拟日期（YYYY-MM-DD，留空=真实今日）"
+        required: false
+        default: ""
+
+permissions:
+  contents: write  # 允许把报告 / 选股清单 写回仓库 output/ 目录
+
+env:
+  TZ: "Asia/Shanghai"
+
+jobs:
+  morning-intel:
+    name: 早盘情报完整流程
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: 🛎️ Checkout 代码
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          persist-credentials: true
+
+      - name: 🐍 安装 Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: ⚙️ 设置时区 + 语言
+        run: |
+          sudo timedatectl set-timezone Asia/Shanghai || echo "timezone ok"
+          echo "LANG=zh_CN.UTF-8" >> $GITHUB_ENV
+          locale -a | grep zh || sudo locale-gen zh_CN.UTF-8 || true
+          date
+
+      - name: 📦 安装项目依赖
+        working-directory: morning_intel_v2
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          pip install -r requirements.txt
+
+      - name: 🧪 调度配置自检（仅打印，不影响后续）
+        working-directory: morning_intel_v2
+        continue-on-error: true
+        env:
+          WECHAT_WEBHOOK: ${{ secrets.WECHAT_WEBHOOK || secrets.QX_WECOM_WEBHOOK || secrets.WECOM_WEBHOOK || secrets.QYWX_WEBHOOK || '' }}
+          TDX_TIMEOUT_SEC: ${{ secrets.TDX_TIMEOUT_SEC || '20' }}
+          ITER_DEBUG: "1"
+        run: |
+          echo ">>> 当前北京时间：$(date '+%Y-%m-%d %H:%M:%S')"
+          python main.py --test-scheduler ${{ inputs.as_of_date && format('--as-of-date={0}', inputs.as_of_date) || '' }}
+
+      - name: 🚀 执行完整六步流程（选股+打分+报告+推送+历史记录）
+        working-directory: morning_intel_v2
+        id: run
+        env:
+          # Webhook 兼容多种命名（优先级：WECHAT > QX_ > WECOM > QYWX）
+          WECHAT_WEBHOOK: ${{ secrets.WECHAT_WEBHOOK || secrets.QX_WECOM_WEBHOOK || secrets.WECOM_WEBHOOK || secrets.QYWX_WEBHOOK || '' }}
+          # 可选：同花顺 iFinD / 通达信 TDX Key 等（若有）
+          IFIND_API_KEY: ${{ secrets.IFIND_API_KEY || '' }}
+          TDX_API_KEY: ${{ secrets.TDX_API_KEY || '' }}
+          TDX_TIMEOUT_SEC: ${{ secrets.TDX_TIMEOUT_SEC || '20' }}
+          # 筛选参数
+          TOP_N: ${{ vars.TOP_N || '5' }}
+          MIN_CANDIDATES: ${{ vars.MIN_CANDIDATES || '30' }}
+          MAX_CANDIDATES: ${{ vars.MAX_CANDIDATES || '60' }}
+          MIN_SCORE_THRESHOLD: ${{ vars.MIN_SCORE_THRESHOLD || '0.0' }}
+          TARGET_PRICE_MIN: ${{ vars.TARGET_PRICE_MIN || '5.0' }}
+          TARGET_MV_BILLION_MIN: ${{ vars.TARGET_MV_BILLION_MIN || '5.0' }}
+          ITER_DEBUG: "1"
+        run: |
+          set -o pipefail
+          FORCE_FLAG=""
+          if [ "${{ inputs.force }}" = "true" ]; then
+            FORCE_FLAG="--force"
+          fi
+          AOD_FLAG=""
+          if [ -n "${{ inputs.as_of_date }}" ]; then
+            AOD_FLAG="--as-of-date=${{ inputs.as_of_date }}"
+          fi
+          python main.py --once $FORCE_FLAG $AOD_FLAG 2>&1 | tee run.log
+
+      - name: 📤 回写生成的报告 / 选股清单 / 历史日志 到仓库
+        if: always()
+        working-directory: morning_intel_v2
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          # 把 output/ 加入（.gitignore 排除 logs/ 但保留 output/）
+          git add -f output/ 2>/dev/null || true
+          git status --short output/ || true
+          if [ -n "$(git status --porcelain output/)" ]; then
+            TODAY_STR=$(date '+%Y%m%d %H:%M')
+            git commit -m "📝 [CI] 每日早盘输出归档 $TODAY_STR (自动提交)"
+            git push
+            echo "✅ output 目录已回写仓库"
+          else
+            echo "ℹ️  本次 output 目录无新增文件，跳过回写"
+          fi
+
+      - name: 📦 上传运行日志 artifact（便于排错）
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: morning-intel-logs-${{ github.run_number }}-${{ github.run_attempt }}
+          path: |
+            morning_intel_v2/logs/*.log*
+            morning_intel_v2/run.log
+            morning_intel_v2/output/**/*.md
+            morning_intel_v2/output/**/*.log
+          if-no-files-found: ignore
+          retention-days: 30
