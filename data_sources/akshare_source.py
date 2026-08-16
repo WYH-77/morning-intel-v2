@@ -440,26 +440,30 @@ class AkshareDataSource(BaseDataSource):
                 logger.error("所有A股列表接口失败：%s", str(e2))
                 return results
 
-        # 列名映射
+        # 列名映射（兼容多套命名：中文 / 英文 code/name / 其他别名）
         col_map = {}
         for c in df.columns:
-            cs = str(c).strip()
-            if cs == "代码":
-                col_map["code"] = c
-            elif cs == "名称":
-                col_map["name"] = c
-            elif "最新价" in cs:
-                col_map["price"] = c
-            elif "流通市值" in cs:
-                col_map["mcap"] = c
-            elif "市盈率" in cs and "动态" in cs:
-                col_map["pe"] = c
-            elif cs == "市净率":
-                col_map["pb"] = c
-            elif "涨跌幅" in cs:
-                col_map["pct"] = c
-            elif "所属行业" in cs:
-                col_map["industry"] = c
+            cs = str(c).strip().lower()
+            orig = c
+            # code
+            if cs in ("代码", "code", "symbol", "stock_code"):
+                col_map["code"] = orig
+            elif cs in ("名称", "name", "stock_name", "简称"):
+                col_map["name"] = orig
+            # price
+            elif "最新价" in cs or cs in ("price", "现价", "收盘"):
+                col_map["price"] = orig
+            elif "流通市值" in cs or cs in ("mcap", "float_mv", "circulating_market_cap"):
+                col_map["mcap"] = orig
+            # pe
+            elif ("市盈率" in cs and "动态" in cs) or cs in ("pe", "pe_ttm", "市盈率"):
+                col_map["pe"] = orig
+            elif "市净率" in cs or cs in ("pb",):
+                col_map["pb"] = orig
+            elif "涨跌幅" in cs or cs in ("pct", "pct_chg", "change_percent", "涨跌幅(%)"):
+                col_map["pct"] = orig
+            elif "所属行业" in cs or cs in ("industry", "行业"):
+                col_map["industry"] = orig
         if "code" not in col_map or "name" not in col_map:
             logger.error("列缺失：现有列=%s", list(df.columns))
             return results

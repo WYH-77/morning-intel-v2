@@ -76,6 +76,76 @@ def _estimate_sector_5d_pct(industry: str, up_sectors, down_sectors) -> float:
     return 0.0
 
 
+def _fallback_universe_from_indices(
+    ds,
+    exclude_board: List[str],
+) -> List[Any]:
+    """
+    二级兜底：从沪深300 + 中证500 + 中证1000 三大宽基指数成分股
+    直接生成 StockBasicInfo 列表（三大指数接口稳定、周末也能返回），
+    保证在东方财富/新浪 spot 接口非交易时段挂掉或列变化时仍能拿到一个股票池。
+    """
+    from data_sources.base import StockBasicInfo
+    results: List[StockBasicInfo] = []
+    try:
+        import akshare as ak
+    except Exception:
+        return results
+
+    def _board(code: str) -> str:
+        if code.startswith("688"): return "科创板"
+        if code.startswith(("300", "301")): return "创业板"
+        if code.startswith(("8", "4", "92")): return "北交所"
+        return "主板"
+
+    # 三大宽基指数成分股抓取：沪深300 / 中证500 / 中证1000
+    fetch_tasks = [
+        ("000300", "沪深300"),
+        ("000905", "中证500"),
+        ("000852", "中证1000"),
+    ]
+    seen = set()
+    for idx_code, idx_name in fetch_tasks:
+        try:
+            df = ak.index_stock_cons_csindex(symbol=idx_code)
+            if df is None or df.empty:
+                continue
+            # 找 code / name 列（可能列名多种）
+            c_code = c_name = None
+            for c in df.columns:
+                cs = str(c).strip().lower()
+                if cs in ("成分券代码", "代码", "code", "con_code") and c_code is None:
+                    c_code = c
+                if cs in ("成分券名称", "名称", "name", "con_name") and c_name is None:
+                    c_name = c
+            if c_code is None or c_name is None:
+                logger.warning("  [%s]成分股列缺失，跳过（现有列=%s）", idx_name, list(df.columns))
+                continue
+            for _, r in df.iterrows():
+                code = str(r[c_code]).strip().zfill(6)
+                if not code.isdigit() or len(code) != 6 or code in seen:
+                    continue
+                seen.add(code)
+                name = str(r[c_name])
+                board = _board(code)
+                if board in (exclude_board or []):
+                    continue
+                if "ST" in name or "*ST" in name or name.startswith("退"):
+                    continue
+                # 兜底值：后续 K 线 / 基本面步骤会覆盖
+                results.append(StockBasicInfo(
+                    code=code, name=name,
+                    price=10.0, change_pct=0.0, market_cap_float=150.0,
+                    pe_ttm=25.0, pb=2.0, industry=idx_name,
+                    is_st=False, board=board, source="index_fallback",
+                ))
+        except Exception as e:
+            logger.debug("  %s 成分股抓取失败：%s", idx_name, str(e)[:80])
+    if results:
+        logger.info("  ✅ 宽基成分股保底池生成成功：共%d只", len(results))
+    return results
+
+
 @catch_exception(default_return=[])
 def screen_candidates(
     config: Dict[str, Any],
@@ -105,7 +175,15 @@ def screen_candidates(
         exclude_board=exclude,
     )
     if not basics:
-        logger.error("❌ 初筛股票池为空（可能接口异常），返回空列表")
+        logger.warning(
+            "⚠️ get_stock_universe 返回空池，启用二级兜底："
+            "沪深300 + 中证500 + 中证1000 成分股作为保底池"
+        )
+        basics = _fallback_universe_from_indices(
+            ds=ds, exclude_board=exclude,
+        )
+    if not basics:
+        logger.error("❌ 初筛股票池为空（所有接口+兜底均失败），返回空列表")
         return []
 
     # 主板限定（再次保险过滤）
