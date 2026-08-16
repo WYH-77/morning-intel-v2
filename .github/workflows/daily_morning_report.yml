@@ -38,6 +38,14 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 25
 
+    # 默认所有 run step 都在仓库根（$GITHUB_WORKSPACE）执行。
+    # 如果你把代码放在仓库的子目录下（例如 morning_intel_v2/），
+    # 把下面的 working-directory 改成对应子目录名即可。
+    defaults:
+      run:
+        shell: bash
+        working-directory: "."
+
     steps:
       - name: 🛎️ Checkout 代码
         uses: actions/checkout@v4
@@ -55,16 +63,18 @@ jobs:
           sudo timedatectl set-timezone Asia/Shanghai || echo "timezone ok"
           echo "LANG=zh_CN.UTF-8" >> $GITHUB_ENV
           locale -a | grep zh || sudo locale-gen zh_CN.UTF-8 || true
+          echo ">>> 确认 main.py 是否在工作目录根：$(ls -1 main.py 2>/dev/null || echo 'NOT FOUND')"
+          echo ">>> 当前工作目录：$(pwd)"
+          echo ">>> 当前目录内容（前20行）："
+          ls -1 | head -20 || true
           date
 
       - name: 📦 安装项目依赖
-        working-directory: morning_intel_v2
         run: |
           python -m pip install --upgrade pip setuptools wheel
           pip install -r requirements.txt
 
       - name: 🧪 调度配置自检（仅打印，不影响后续）
-        working-directory: morning_intel_v2
         continue-on-error: true
         env:
           WECHAT_WEBHOOK: ${{ secrets.WECHAT_WEBHOOK || secrets.QX_WECOM_WEBHOOK || secrets.WECOM_WEBHOOK || secrets.QYWX_WEBHOOK || '' }}
@@ -75,7 +85,6 @@ jobs:
           python main.py --test-scheduler ${{ inputs.as_of_date && format('--as-of-date={0}', inputs.as_of_date) || '' }}
 
       - name: 🚀 执行完整六步流程（选股+打分+报告+推送+历史记录）
-        working-directory: morning_intel_v2
         id: run
         env:
           # Webhook 兼容多种命名（优先级：WECHAT > QX_ > WECOM > QYWX）
@@ -106,8 +115,8 @@ jobs:
 
       - name: 📤 回写生成的报告 / 选股清单 / 历史日志 到仓库
         if: always()
-        working-directory: morning_intel_v2
         run: |
+          # 工作目录 == $GITHUB_WORKSPACE 也就是仓库根，直接 git 操作
           git config --global user.name "github-actions[bot]"
           git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
@@ -129,9 +138,9 @@ jobs:
         with:
           name: morning-intel-logs-${{ github.run_number }}-${{ github.run_attempt }}
           path: |
-            morning_intel_v2/logs/*.log*
-            morning_intel_v2/run.log
-            morning_intel_v2/output/**/*.md
-            morning_intel_v2/output/**/*.log
+            logs/*.log*
+            run.log
+            output/**/*.md
+            output/**/*.log
           if-no-files-found: ignore
           retention-days: 30
